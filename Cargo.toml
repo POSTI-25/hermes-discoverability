@@ -1,0 +1,9 @@
+[package]
+name = "hermes-discoverability"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libp2p = "0.55.0"
+libp2p-kad = "0.47.0"
+tokio = "1.45.1"
