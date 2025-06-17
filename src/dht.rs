@@ -1,4 +1,4 @@
-use libp2p::kad::{Behaviour, Record, RecordKey, Kademlia};
+use libp2p::kad::{Behaviour, Record, RecordKey};
 use libp2p::PeerId;
 use libp2p::kad::Quorum;
 use libp2p::kad::store::MemoryStore;
@@ -6,7 +6,7 @@ use libp2p::swarm::NetworkBehaviour; // Import the derive macro
 
 #[derive(NetworkBehaviour)]
 pub struct KademliaBehaviour {
-    pub dht: Kademlia<MemoryStore>,
+    pub dht: Behaviour<MemoryStore>,
 }
 
 pub fn put_record(
@@ -22,7 +22,7 @@ pub fn put_record(
         expires: None, // Specifies that the record does not expire
     };
 
-    match dht.put_record(record, Quorum::One) {
+    match behaviour.dht.put_record(record, Quorum::One) {
         Ok(id) => Ok(id),
         Err(e) => Err(format!("Failed to put record: {}", e)),
     }
@@ -30,18 +30,21 @@ pub fn put_record(
 }
 
 pub fn get_record(
-    dht: &mut Kademlia<MemoryStore>,
+    behaviour: &mut KademliaBehaviour,
     key: &str,
 ) -> libp2p::kad::QueryId {
-    dht.get_record(RecordKey::new(&key))
+    behaviour.dht.get_record(RecordKey::new(&key))
 }
 
 pub fn remove_record(
-    dht: &mut Kademlia<MemoryStore>,
+    behaviour: &mut KademliaBehaviour,
     key: &str,
 ) -> Result<(), String> {
-    match dht.remove_record(RecordKey::new(&key)) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!("Failed to remove record: {}", e)),
-    }
+    behaviour.dht.remove_record(&RecordKey::new(&key));
+    Ok(())
+}
+
+fn main() {
+    // Placeholder main function
+    println!("Hermes ACM");
 }
