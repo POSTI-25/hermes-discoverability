@@ -12,7 +12,7 @@ use libp2p::{
 use tokio::{
     io::{self, AsyncBufReadExt},
     select,
-};
+}; 
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
  

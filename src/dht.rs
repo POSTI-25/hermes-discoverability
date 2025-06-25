@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Likely listening on all interfaces now, thus continuing by breaking the loop.
                     break;
                 }
-            }
+            } 
         }
     });
 

@@ -34,6 +34,10 @@ name = "dht_db_old"
 path = "src/dht_db_old.rs"
 
 [[bin]] 
+name = "routing_table" 
+path = "src/routing_table.rs" 
+
+[[bin]] 
 name = "try1" 
 path = "src/try1.rs" 
 

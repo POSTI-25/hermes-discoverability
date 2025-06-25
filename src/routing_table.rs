@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Represents a peer in the routing table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] 
 pub struct PeerInfo {
     /// The known addresses of the peer.
     pub addresses: Vec<libp2p::Multiaddr>,
