@@ -1,47 +1,380 @@
-use libp2p::kad::{Behaviour, Record, RecordKey, Kademlia};
-use libp2p::PeerId;
-use libp2p::kad::Quorum;
-use libp2p::kad::store::MemoryStore;
-use libp2p::swarm::NetworkBehaviour; // Import the derive macro
+// Copyright 2021 Protocol Labs.
+// Copyright 2019 Parity Technologies (UK) Ltd.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 
-#[derive(NetworkBehaviour)]
-pub struct KademliaBehaviour {
-    pub dht: Kademlia<MemoryStore>,
+// #![doc = include_str!("../README.md")]
+
+use std::{error::Error, str::FromStr};
+
+use clap::Parser;
+use futures::{executor::block_on, future::FutureExt, stream::StreamExt};
+use libp2p::{
+    core::multiaddr::{Multiaddr, Protocol},
+    dcutr, identify, identity, noise, ping, relay,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, PeerId,
+    kad::{self, store::MemoryStore},
+};
+use tokio::{
+    io::{self, AsyncBufReadExt},
+    select,
+};
+use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Parser)]
+#[command(name = "libp2p DCUtR client with Kademlia")]
+struct Opts {
+    /// The mode (client-listen, client-dial).
+    #[arg(long)]
+    mode: Mode,
+
+    /// Fixed value to generate deterministic peer id.
+    #[arg(long)]
+    secret_key_seed: u8,
+
+    /// The listening address
+    #[arg(long)]
+    relay_address: Multiaddr,
+
+    /// Peer ID of the remote peer to hole punch to.
+    #[arg(long)]
+    remote_peer_id: Option<PeerId>,
 }
 
-pub fn put_record(
-    behaviour: &mut KademliaBehaviour,
-    key: &str,
-    value: Vec<u8>,
-    peer_id: PeerId,
-) -> Result<libp2p::kad::QueryId, String> {
-    let record = Record {
-        key: RecordKey::new(&key),
-        value,
-        publisher: Some(peer_id),
-        expires: None, // Specifies that the record does not expire
-    };
+#[derive(Clone, Debug, PartialEq, Parser)]
+enum Mode {
+    Dial,
+    Listen,
+}
 
-    match dht.put_record(record, Quorum::One) {
-        Ok(id) => Ok(id),
-        Err(e) => Err(format!("Failed to put record: {}", e)),
+impl FromStr for Mode {
+    type Err = String;
+    fn from_str(mode: &str) -> Result<Self, Self::Err> {
+        match mode {
+            "dial" => Ok(Mode::Dial),
+            "listen" => Ok(Mode::Listen),
+            _ => Err("Expected either 'dial' or 'listen'".to_string()),
+        }
     }
-    /* A quick note: the put_record() function does not return "Ok" directly. Instead, it returns the query ID of the put operation, which can be used to track its progress. */
 }
 
-pub fn get_record(
-    dht: &mut Kademlia<MemoryStore>,
-    key: &str,
-) -> libp2p::kad::QueryId {
-    dht.get_record(RecordKey::new(&key))
-}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+ 
+    let opts = Opts::parse();
 
-pub fn remove_record(
-    dht: &mut Kademlia<MemoryStore>,
-    key: &str,
-) -> Result<(), String> {
-    match dht.remove_record(RecordKey::new(&key)) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!("Failed to remove record: {}", e)),
+    #[derive(NetworkBehaviour)]
+    struct Behaviour {
+        relay_client: relay::client::Behaviour,
+        ping: ping::Behaviour,
+        identify: identify::Behaviour,
+        dcutr: dcutr::Behaviour,
+        kademlia: kad::Behaviour<MemoryStore>,
     }
+
+    let mut swarm =
+        libp2p::SwarmBuilder::with_existing_identity(generate_ed25519(opts.secret_key_seed))
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_quic()
+            .with_dns()?
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|keypair, relay_behaviour| Behaviour {
+                relay_client: relay_behaviour,
+                ping: ping::Behaviour::new(ping::Config::new()),
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/TODO/0.0.1".to_string(),
+                    keypair.public(),
+                )),
+                dcutr: dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                kademlia: kad::Behaviour::new(
+                    keypair.public().to_peer_id(),
+                    MemoryStore::new(keypair.public().to_peer_id()),
+                ),
+            })?
+            .build();
+
+    swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server)); // Set Kademlia mode to Server
+
+    swarm
+        .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+        .unwrap();
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+        .unwrap();
+
+    // Read full lines from stdin
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+
+
+    // Wait to listen on all interfaces.
+    block_on(async {
+        let mut delay = futures_timer::Delay::new(std::time::Duration::from_secs(1)).fuse();
+        loop {
+            futures::select! {
+                event = swarm.next() => {
+                    match event.unwrap() {
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("Listening on address: {address}");
+                        }
+                        event => panic!("{event:?}"),
+                    }
+                }
+                _ = delay => {
+                    // Likely listening on all interfaces now, thus continuing by breaking the loop.
+                    break;
+                }
+            }
+        }
+    });
+
+    // Connect to the relay server to learn our local public address and bootstrap Kademlia.
+    swarm.dial(opts.relay_address.clone()).unwrap();
+    block_on(async {
+        let mut learned_observed_addr = false;
+        let mut told_relay_observed_addr = false;
+
+        loop {
+            match swarm.next().await.unwrap() {
+                SwarmEvent::NewListenAddr { .. } => {}
+                SwarmEvent::Dialing { .. } => {}
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, opts.relay_address.clone());
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
+                SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Sent {
+                    ..
+                })) => {
+                    tracing::info!("Told relay its public address");
+                    told_relay_observed_addr = true;
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                    info: identify::Info { observed_addr, .. },
+                    ..
+                })) => {
+                    tracing::info!(address=%observed_addr, "Relay told us our observed address");
+                    learned_observed_addr = true;
+                }
+                // --- ADD THIS ARM ---
+        // Kademlia events are not important for the initial relay setup.
+        // We can safely ignore them.
+        SwarmEvent::Behaviour(BehaviourEvent::Kademlia(_)) => {}
+        
+        // --- KEEP THE PANIC FOR UNEXPECTED THINGS ---
+        event => panic!("{event:?}"),
+            }
+
+            if learned_observed_addr && told_relay_observed_addr {
+                break;
+            }
+        }
+    });
+
+    match opts.mode {
+        Mode::Dial => {
+            let remote_peer_id = opts.remote_peer_id.unwrap();
+            let relay_addr = opts.relay_address.with(Protocol::P2pCircuit);
+            swarm.behaviour_mut().kademlia.add_address(&remote_peer_id, relay_addr.clone());
+
+            swarm
+                .dial(
+                    relay_addr
+                        .with(Protocol::P2p(remote_peer_id)),
+                )
+                .unwrap();
+        }
+        Mode::Listen => {
+            swarm
+                .listen_on(opts.relay_address.with(Protocol::P2pCircuit))
+                .unwrap();
+        }
+    }
+
+    loop {
+        select! {
+            Ok(Some(line)) = stdin.next_line() => {
+                handle_input_line(&mut swarm.behaviour_mut().kademlia, line);
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Listening on address: {address}");
+                }
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } => {
+                    tracing::info!(peer=%peer_id, ?endpoint, "Established new connection");
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { .. },
+                )) => {
+                    assert!(opts.mode == Mode::Listen);
+                    tracing::info!("Relay accepted our reservation request");
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed { result, ..})) => {
+                    match result {
+                        kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { key, providers, .. })) => {
+                            for peer in providers {
+                                println!(
+                                    "Peer {peer:?} provides key {:?}",
+                                    std::str::from_utf8(key.as_ref()).unwrap()
+                                );
+                            }
+                        }
+                        kad::QueryResult::GetProviders(Err(err)) => {
+                            eprintln!("Failed to get providers: {err:?}");
+                        }
+                        kad::QueryResult::GetRecord(Ok(
+                            kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+                                record: kad::Record { key, value, .. },
+                                ..
+                            })
+                        )) => {
+                            println!(
+                                "Got record {:?} {:?}",
+                                std::str::from_utf8(key.as_ref()).unwrap(),
+                                std::str::from_utf8(&value).unwrap(),
+                            );
+                        }
+                        kad::QueryResult::GetRecord(Ok(_)) => {}
+                        kad::QueryResult::GetRecord(Err(err)) => {
+                            eprintln!("Failed to get record: {err:?}");
+                        }
+                        kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                            println!(
+                                "Successfully put record {:?}",
+                                std::str::from_utf8(key.as_ref()).unwrap()
+                            );
+                        }
+                        kad::QueryResult::PutRecord(Err(err)) => {
+                            eprintln!("Failed to put record: {err:?}");
+                        }
+                        kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
+                            println!(
+                                "Successfully put provider record {:?}",
+                                std::str::from_utf8(key.as_ref()).unwrap()
+                            );
+                        }
+                        kad::QueryResult::StartProviding(Err(err)) => {
+                            eprintln!("Failed to put provider record: {err:?}");
+                        }
+                        _ => {}
+                    }
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    tracing::info!(peer=?peer_id, "Outgoing connection failed: {error}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn handle_input_line(kademlia: &mut kad::Behaviour<MemoryStore>, line: String) {
+    let mut args = line.split(' ');
+
+    match args.next() {
+        Some("GET") => {
+            let key = {
+                match args.next() {
+                    Some(key) => kad::RecordKey::new(&key),
+                    None => {
+                        eprintln!("Expected key");
+                        return;
+                    }
+                }
+            };
+            kademlia.get_record(key);
+        }
+        Some("GET_PROVIDERS") => {
+            let key = {
+                match args.next() {
+                    Some(key) => kad::RecordKey::new(&key),
+                    None => {
+                        eprintln!("Expected key");
+                        return;
+                    }
+                }
+            };
+            kademlia.get_providers(key);
+        }
+        Some("PUT") => {
+            let key = {
+                match args.next() {
+                    Some(key) => kad::RecordKey::new(&key),
+                    None => {
+                        eprintln!("Expected key");
+                        return;
+                    }
+                }
+            };
+            let value = {
+                match args.next() {
+                    Some(value) => value.as_bytes().to_vec(),
+                    None => {
+                        eprintln!("Expected value");
+                        return;
+                    }
+                }
+            };
+            let record = kad::Record {
+                key,
+                value,
+                publisher: None,
+                expires: None,
+            };
+            kademlia
+                .put_record(record, kad::Quorum::One)
+                .expect("Failed to store record locally.");
+        }
+        Some("PUT_PROVIDER") => {
+            let key = {
+                match args.next() {
+                    Some(key) => kad::RecordKey::new(&key),
+                    None => {
+                        eprintln!("Expected key");
+                        return;
+                    }
+                }
+            };
+
+            kademlia
+                .start_providing(key)
+                .expect("Failed to start providing key");
+        }
+        _ => {
+            eprintln!("expected GET, GET_PROVIDERS, PUT or PUT_PROVIDER");
+        }
+    }
+}
+
+fn generate_ed25519(secret_key_seed: u8) -> identity::Keypair {
+    let mut bytes = [0u8; 32];
+    bytes[0] = secret_key_seed;
+
+    identity::Keypair::ed25519_from_bytes(bytes).expect("only errors on wrong length")
 }
