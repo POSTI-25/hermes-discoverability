@@ -41,3 +41,11 @@ path = "src/routing_table.rs"
 name = "try1" 
 path = "src/try1.rs" 
 
+[[bin]] 
+name = "modified_dhtdb" 
+path = "src/TRYagain/modified_dhtdb.rs"  
+
+[[bin]]  
+name = "rt" 
+path = "src/TRYagain/rt.rs"  
+
